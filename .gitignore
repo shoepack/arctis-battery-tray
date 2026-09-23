@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+build/
+dist/
+build.log
+*.spec
+tools/*.png
+tools/watch_log.txt

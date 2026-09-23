@@ -1,0 +1,4 @@
+hidapi==0.15.0
+PySide6-Essentials==6.11.2
+pyinstaller==6.22.3
+pytest==9.1.1
