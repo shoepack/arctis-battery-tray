@@ -1,10 +1,12 @@
 """Tray app: polls the dongle, feeds the tracker, draws the icon and card."""
 import ctypes
+import faulthandler
 import json
 from logging.handlers import RotatingFileHandler
 import logging
 import os
 from pathlib import Path
+import subprocess
 import sys
 import threading
 import time
@@ -21,6 +23,8 @@ from .tracker import LearnedRates, Tracker
 
 POLL_S = 2
 CONFIRM_S = 1        # a changed level is re-read quickly so plug/unplug shows fast
+HANG_DUMP_S = 60     # UI thread silent this long: write every thread's stack
+HANG_RESTART_READINGS = 45   # ~90 s of unhandled readings: restart the app
 DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "ArctisBatteryTray"
 MUTEX_NAME = "Local\\ArctisBatteryTray"
 ERROR_ALREADY_EXISTS = 183
@@ -48,6 +52,7 @@ class Poller(QObject):
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._confirm = False
+        self.unprocessed = 0        # readings sent that the UI thread hasn't handled
 
     def start(self):
         threading.Thread(target=self._run, name="poller", daemon=True).start()
@@ -73,6 +78,11 @@ class Poller(QObject):
                 log.exception("Unexpected error reading the dongle")
                 r = device.Reading(device.ERROR)
             self.reading.emit(r)
+            self.unprocessed += 1
+            # Counted in readings, not wall time, so sleep/hibernate (no
+            # readings sent) can't look like a hang.
+            if self.unprocessed > HANG_RESTART_READINGS:
+                _restart_after_hang()
             self._wake.wait(POLL_S)
             self._wake.clear()
             if self._confirm:
@@ -112,6 +122,7 @@ class App(QObject):
             self.style = DEFAULT_STYLE
         self.snap = None
         self.icon_key = None
+        self.tooltip = None
         self.log_key = None
 
         self.card = Card()
@@ -180,6 +191,11 @@ class App(QObject):
     # -- updates -------------------------------------------------------------
 
     def _on_reading(self, reading):
+        # Hang diagnostics: if this thread doesn't get back here within
+        # HANG_DUMP_S, every thread's stack is written to hang.log.
+        self.poller.unprocessed = 0
+        faulthandler.cancel_dump_traceback_later()
+        faulthandler.dump_traceback_later(HANG_DUMP_S, file=_hang_file())
         now = time.time()
         self.snap = snap = self.tracker.update(reading, now)
         if self.tracker.pending is not None:
@@ -197,7 +213,12 @@ class App(QObject):
         else:
             state = IconState("off")
         self._set_icon(state)
-        self.tray.setToolTip(text.tooltip(snap, now))
+        # Every tray update is a synchronous call into Explorer, which can
+        # stall; only make one when something visible changed.
+        tip = text.tooltip(snap, now)
+        if tip != self.tooltip:
+            self.tray.setToolTip(tip)
+            self.tooltip = tip
         if self.card.isVisible():
             self.card.show_snapshot(snap, self.theme, now)
 
@@ -255,17 +276,51 @@ def _setup_logging():
     sys.excepthook = lambda *exc: log.critical("Uncaught exception", exc_info=exc)
 
 
-def _claim_single_instance():
+_hang_fh = None
+
+
+def _hang_file():
+    global _hang_fh
+    if _hang_fh is None:
+        _hang_fh = open(DATA_DIR / "hang.log", "a", encoding="utf-8")
+    return _hang_fh
+
+
+def _restart_after_hang():
+    """Called from the poller thread when the UI thread has stopped handling
+    readings. Writes directly to hang.log rather than through logging, whose
+    lock the stuck thread may be holding, then starts a fresh copy."""
+    f = _hang_file()
+    f.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} UI thread unresponsive; restarting\n")
+    faulthandler.dump_traceback(file=f, all_threads=True)
+    f.flush()
+    try:
+        subprocess.Popen(startup.argv() + ["--replace"], close_fds=True)
+    finally:
+        os._exit(3)
+
+
+def _claim_single_instance(wait_s: float = 0):
+    """A named mutex marks the running copy. A replacement started by
+    _restart_after_hang waits for the old copy to exit and release it."""
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
-    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
-        return None
-    return handle
+    deadline = time.monotonic() + wait_s
+    while True:
+        handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+        if ctypes.get_last_error() != ERROR_ALREADY_EXISTS:
+            return handle
+        kernel32.CloseHandle(handle)   # else we'd keep the old copy's mutex alive
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.5)
 
 
 def main():
     _setup_logging()
-    mutex = _claim_single_instance()
+    replacing = "--replace" in sys.argv
+    mutex = _claim_single_instance(wait_s=20 if replacing else 0)
+    if replacing:
+        log.warning("Restarted after the previous copy stopped responding; see hang.log")
     if mutex is None:
         log.info("Already running; exiting")
         return

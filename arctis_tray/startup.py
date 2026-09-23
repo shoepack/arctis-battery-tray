@@ -8,13 +8,17 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 VALUE = "ArctisBatteryTray"
 
 
-def command() -> str:
+def argv() -> list[str]:
     if getattr(sys, "frozen", False):
-        return f'"{sys.executable}"'
+        return [sys.executable]
     # Running from source: use pythonw so no console window appears.
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     main = Path(__file__).resolve().parents[1] / "run.pyw"
-    return f'"{pythonw}" "{main}"'
+    return [str(pythonw), str(main)]
+
+
+def command() -> str:
+    return " ".join(f'"{a}"' for a in argv())
 
 
 def is_enabled() -> bool:
