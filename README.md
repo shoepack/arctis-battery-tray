@@ -102,8 +102,14 @@ no charging flag, so charging is inferred:
 The headset updates its reported level only every 12-15 seconds, so expect
 about 15-20 seconds between plugging in and the icon turning green.
 
+`ArctisBattery.exe` is a small supervisor that runs the tray app as a child
+process (`--child`) and restarts it within seconds if it ever exits other
+than through Quit, so a crash or a Windows "not responding" close doesn't
+leave you without the icon. Two processes in Task Manager is expected.
+
 Code map: `arctis_tray/device.py` (HID), `tracker.py` (charging detection,
-correction, estimates), `icons.py`, `card.py`, `app.py` (tray, polling).
+correction, estimates), `icons.py`, `card.py`, `app.py` (tray, polling,
+supervisor).
 
 ## Updating
 

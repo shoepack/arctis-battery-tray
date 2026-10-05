@@ -23,8 +23,11 @@ from .tracker import LearnedRates, Tracker
 
 POLL_S = 2
 CONFIRM_S = 1        # a changed level is re-read quickly so plug/unplug shows fast
-HANG_DUMP_S = 60     # UI thread silent this long: write every thread's stack
+HANG_DUMP_S = 10     # UI thread silent this long: write every thread's stack
 HANG_RESTART_READINGS = 45   # ~90 s of unhandled readings: restart the app
+RESTART_DELAY_S = 3
+EXIT_HUNG = 3
+EXIT_NO_TRAY = 4
 DATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / "ArctisBatteryTray"
 MUTEX_NAME = "Local\\ArctisBatteryTray"
 ERROR_ALREADY_EXISTS = 183
@@ -195,7 +198,7 @@ class App(QObject):
         # HANG_DUMP_S, every thread's stack is written to hang.log.
         self.poller.unprocessed = 0
         faulthandler.cancel_dump_traceback_later()
-        faulthandler.dump_traceback_later(HANG_DUMP_S, file=_hang_file())
+        faulthandler.dump_traceback_later(HANG_DUMP_S, repeat=True, file=_hang_file())
         now = time.time()
         self.snap = snap = self.tracker.update(reading, now)
         if self.tracker.pending is not None:
@@ -265,9 +268,11 @@ class App(QObject):
         self.card.open_near(anchor, screen.availableGeometry())
 
 
-def _setup_logging():
+def _setup_logging(filename: str):
+    # One file per process: two processes rotating the same file collide on
+    # Windows (the rename fails while the other has it open).
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(DATA_DIR / "app.log", maxBytes=256_000, backupCount=1,
+    handler = RotatingFileHandler(DATA_DIR / filename, maxBytes=256_000, backupCount=1,
                                   encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root = logging.getLogger()
@@ -289,47 +294,69 @@ def _hang_file():
 def _restart_after_hang():
     """Called from the poller thread when the UI thread has stopped handling
     readings. Writes directly to hang.log rather than through logging, whose
-    lock the stuck thread may be holding, then starts a fresh copy."""
+    lock the stuck thread may be holding, then exits so the supervisor
+    starts a fresh copy."""
     f = _hang_file()
     f.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} UI thread unresponsive; restarting\n")
     faulthandler.dump_traceback(file=f, all_threads=True)
     f.flush()
-    try:
-        subprocess.Popen(startup.argv() + ["--replace"], close_fds=True)
-    finally:
-        os._exit(3)
+    os._exit(EXIT_HUNG)
 
 
-def _claim_single_instance(wait_s: float = 0):
-    """A named mutex marks the running copy. A replacement started by
-    _restart_after_hang waits for the old copy to exit and release it."""
+def _claim_single_instance():
+    """A named mutex marks the running supervisor."""
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    deadline = time.monotonic() + wait_s
+    handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        return None
+    return handle
+
+
+def _supervise():
+    """Run the tray app as a child process and restart it whenever it exits
+    other than through Quit. The tray app has frozen twice inside a call to
+    another process (Windows AppHangXProcB1) and been closed by Windows before
+    its own watchdog could act; this process has no UI, so it can't hang
+    that way, and it brings the icon back within seconds."""
+    sup = logging.getLogger("arctis_tray.supervisor")
+    failures: list[float] = []
     while True:
-        handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
-        if ctypes.get_last_error() != ERROR_ALREADY_EXISTS:
-            return handle
-        kernel32.CloseHandle(handle)   # else we'd keep the old copy's mutex alive
-        if time.monotonic() >= deadline:
-            return None
-        time.sleep(0.5)
+        child = subprocess.Popen(startup.argv() + ["--child"])
+        code = child.wait()
+        if code == 0:
+            sup.info("App quit; supervisor exiting")
+            return
+        now = time.monotonic()
+        failures = [t for t in failures if now - t < 300] + [now]
+        # Back off if it keeps dying, e.g. no tray yet at sign-in.
+        delay = RESTART_DELAY_S if len(failures) < 5 else 60
+        sup.warning("App exited with code %#x; restarting in %d s", code & 0xFFFFFFFF, delay)
+        time.sleep(delay)
 
 
-def main():
-    _setup_logging()
-    replacing = "--replace" in sys.argv
-    mutex = _claim_single_instance(wait_s=20 if replacing else 0)
-    if replacing:
-        log.warning("Restarted after the previous copy stopped responding; see hang.log")
-    if mutex is None:
-        log.info("Already running; exiting")
-        return
+def _run_tray_app():
     qapp = QApplication(sys.argv)
     qapp.setQuitOnLastWindowClosed(False)
     qapp.setApplicationName("Arctis Battery")
     if not QSystemTrayIcon.isSystemTrayAvailable():
-        log.error("No system tray available")
-        return
+        # Can happen right after sign-in, before the taskbar exists; a
+        # non-zero exit makes the supervisor try again shortly.
+        log.error("No system tray available yet")
+        sys.exit(EXIT_NO_TRAY)
     log.info("Starting")
     app = App()  # noqa: F841  (kept alive for the event loop)
     sys.exit(qapp.exec())
+
+
+def main():
+    if "--child" in sys.argv:
+        _setup_logging("app.log")
+        _run_tray_app()
+        return
+    _setup_logging("supervisor.log")
+    if _claim_single_instance() is None:
+        log.info("Already running; exiting")
+        return
+    log.info("Supervisor started")
+    _supervise()

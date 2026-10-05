@@ -1,8 +1,8 @@
-"""Manual check of the hang watchdog: run the app from source, then freeze
-its UI thread after a few readings. Expect hang.log to get stack dumps at
-~60 s and a replacement copy (normal, unpatched) to start at ~90 s.
-Quit any running copy first; the replacement runs from source, so relaunch
-the exe afterwards to point Start with Windows back at it."""
+"""Manual check of the hang watchdog: run the tray app from source (without
+the supervisor), then freeze its UI thread after a few readings. Expect
+hang.log to get stack dumps every 10 s and the process to exit with code 3
+after ~90 s; under the supervisor, that exit triggers a restart.
+Quit any running copy first."""
 import sys
 import time
 from pathlib import Path
@@ -25,4 +25,5 @@ def freezing_on_reading(self, reading):
 
 
 app.App._on_reading = freezing_on_reading
-app.main()
+app._setup_logging("app.log")
+app._run_tray_app()
