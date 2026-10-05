@@ -125,6 +125,9 @@ install command again. It stops the running copy, rebuilds, and restarts it.
 - **Charging turns green late or not at all:** see the delay note above. A
   loose cable can light the headset's LED without charging; the icon stays
   white in that case.
+- **Doesn't start when you sign in:** check Settings → Apps → Startup and
+  make sure ArctisBattery is On. (Versions before October 2026 wrote only the
+  Run entry, which current Windows 11 skips; launching the app once fixes it.)
 - **Anything else:** check `%APPDATA%\ArctisBatteryTray\app.log`.
 
 ## Development
